@@ -35,6 +35,7 @@ from torch.testing._internal.common_cuda import (
     PLATFORM_SUPPORTS_FLASH_ATTENTION, PLATFORM_SUPPORTS_MEM_EFF_ATTENTION
 )
 from torch._dynamo.comptime import comptime
+from torch.distributed._functional_collectives import _maybe_wrap_tensor
 
 def reset_rng_state():
     torch.manual_seed(1337)
@@ -289,26 +290,45 @@ class TestMultiProc(DynamoDistributedMultiProcTestCase):
             outputs = m(inputs)
             self.assertTrue(same(correct_outputs, outputs))
 
+    def _test_hf_bert_ddp_inductor(self, static_graph):
+        with _dynamo_dist_per_rank_init(self.rank, self.world_size):
+            model, inputs = get_hf_bert(self.rank)
+            model = DDP(model, static_graph=static_graph)
+            run_hf_bert_ddp(self, model, inputs, "inductor")
+
     @skip_if_lt_x_gpu(2)
     @import_transformers_or_skip()
     @unittest.skipIf(not has_triton(), "Inductor+gpu needs triton and recent GPU arch")
     @patch.object(config, "optimize_ddp", True)
     @patch.object(torch._inductor.config, "fallback_random", True)
     def test_hf_bert_ddp_inductor(self):
+        self._test_hf_bert_ddp_inductor(static_graph=False)
 
+    @skip_if_lt_x_gpu(2)
+    @import_transformers_or_skip()
+    @unittest.skipIf(not has_triton(), "Inductor+gpu needs triton and recent GPU arch")
+    @patch.object(config, "optimize_ddp", True)
+    @patch.object(torch._inductor.config, "fallback_random", True)
+    def test_hf_bert_ddp_inductor_static_graph(self):
+        self._test_hf_bert_ddp_inductor(static_graph=True)
+
+    def _test_hf_bert_aot_eager(self, static_graph):
         with _dynamo_dist_per_rank_init(self.rank, self.world_size):
             model, inputs = get_hf_bert(self.rank)
-            model = DDP(model)
-            run_hf_bert_ddp(self, model, inputs, "inductor")
+            model = DDP(model, static_graph=static_graph)
+            run_hf_bert_ddp(self, model, inputs, "aot_eager")
 
     @skip_if_lt_x_gpu(2)
     @import_transformers_or_skip()
     @patch.object(config, "optimize_ddp", True)
     def test_hf_bert_ddp_aot_eager(self):
-        with _dynamo_dist_per_rank_init(self.rank, self.world_size):
-            model, inputs = get_hf_bert(self.rank)
-            model = DDP(model)
-            run_hf_bert_ddp(self, model, inputs, "aot_eager")
+        self._test_hf_bert_aot_eager(static_graph=False)
+
+    @skip_if_lt_x_gpu(2)
+    @import_transformers_or_skip()
+    @patch.object(config, "optimize_ddp", True)
+    def test_hf_bert_ddp_aot_eager_static_graph(self):
+        self._test_hf_bert_aot_eager(static_graph=True)
 
     @skip_if_lt_x_gpu(2)
     @unittest.skipIf(not has_triton(), "Inductor+gpu needs triton and recent GPU arch")
@@ -855,6 +875,52 @@ class TestSingleProc(DynamoDistributedSingleProcTestCase):
                 .run(GUARDS_FILE.getvalue())
             self.assertTrue(same(correct_outputs, outputs))
 
+    def test_fsdp_skip_register_attr_or_module(self):
+        """
+        ensure FSDP module is not registered as attrbutes
+        in the fx graph
+        see `not source.guard_source().is_fsdp_module()`
+        before calling `register_attr_or_module`
+        in variables/builder.py
+        """
+        class ToyModel(nn.Module):
+            def __init__(self, in_feat=10, hidden_feat=5000, out_feat=5):
+                super().__init__()
+                self.net = nn.Sequential(
+                    *[nn.Linear(in_feat, hidden_feat), nn.ReLU()]
+                    + [nn.Linear(hidden_feat, hidden_feat), nn.ReLU()]
+                )
+
+            def forward(self, inputs):
+                out = self.net(inputs)
+                return out
+
+        torch._dynamo.reset()
+
+        device = f"cuda:{self.rank}"
+        m = ToyModel(in_feat=10, hidden_feat=5000, out_feat=5,).to(device)
+        inputs = torch.rand(20, 10).to(device)
+        m.apply(init_weights)
+        correct_outputs = m(inputs)
+        fsdp_m = FSDP(m, use_orig_params=True)
+
+        def debug_compiler(gm, _):
+            for node in gm.graph.nodes:
+                if node.op == "get_attr":
+                    for name in [
+                        "l__self___net_0_weight",
+                        "l__self___net_0_bias",
+                        "l__self___net_2_weight",
+                        "l__self___net_2_bias"
+                    ]:
+                        self.assertFalse(name in node.name, f"FSDP module {name} should not be registered as attributes")
+            return gm
+
+        opt_m = torch._dynamo.optimize(backend=debug_compiler)(fsdp_m)
+        outputs = opt_m(inputs)
+
+        self.assertTrue(same(correct_outputs, outputs))
+
     def test_fsdp_dup_tensors_same_source(self):
         """
         Tests that FSDP-managed modules' parameters and buffers with the same
@@ -971,6 +1037,18 @@ class TestSingleProc(DynamoDistributedSingleProcTestCase):
             self.assertEqual(cnt.frame_count, 1)
         for test_out in test_outs:
             self.assertEqual(test_out, ref_out)
+
+    def test_async_subclass_no_specialize(self):
+        cnt = torch._dynamo.testing.CompileCounterWithBackend("eager")
+
+        @torch.compile(backend=cnt, fullgraph=True, dynamic=True)
+        def f(x):
+            return x + 1
+
+        f(_maybe_wrap_tensor(torch.randn(10)))
+        f(_maybe_wrap_tensor(torch.randn(12)))
+
+        self.assertEqual(cnt.frame_count, 1)
 
 
 if __name__ == "__main__":

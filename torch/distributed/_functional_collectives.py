@@ -142,6 +142,40 @@ def broadcast(self: torch.Tensor, src: int, group: RANK_TYPES, tag: str = ""):
     return _maybe_wrap_tensor(tensor)
 
 
+def scatter_tensor(
+    self: torch.Tensor,
+    src: int,
+    scatter_dim: int,
+    group: RANK_TYPES,
+    tag: str = "",
+) -> torch.Tensor:
+    """
+    Scatters a tensor to all processes in a specified group.
+
+    Args:
+        src (int): The rank of the source process.
+        scatter_dim (int): The dimension along which to scatter.
+        group (RANK_TYPES): The process group to work on.
+        tag (str, optional): A unique identifier for the collective. Default: empty string.
+
+    Returns:
+        torch.Tensor: The scattered tensor shard corresponding to this rank.
+    """
+    tag, rankset, group_size = _expand_group(group, tag)
+    assert (
+        self.size(scatter_dim) % group_size == 0
+    ), f"input dimension {scatter_dim} ({self.size(scatter_dim)} must be a multiple of group_size {group_size}"
+
+    # Adjust tensor dimension if necessary
+    if scatter_dim != 0:
+        tensor_list = torch.chunk(self, group_size, dim=scatter_dim)
+        self = torch.cat(tensor_list, dim=0)
+
+    tensor = torch.ops.c10d_functional.scatter_tensor(self, src, scatter_dim, tag, rankset, group_size)
+    return _maybe_wrap_tensor(tensor)
+
+
+
 def all_reduce(self: torch.Tensor, reduceOp: str, group: RANK_TYPES, tag: str = ""):
     """
     Reduces the tensor data across all machines in such a way that all get
@@ -389,7 +423,7 @@ class AsyncCollectiveTensor(torch.Tensor):
         return self.elem.tolist()
 
     @staticmethod
-    def __tensor_unflatten__(inner_tensors, meta):
+    def __tensor_unflatten__(inner_tensors, meta, outer_size, outer_stride):
         assert meta is None
         elem = inner_tensors["elem"]
         return AsyncCollectiveTensor(elem)
@@ -580,6 +614,11 @@ def _reduce_scatter_tensor_coalesced_meta(inputs, reduceOp, tag, rankset, group_
 
     return [mk_out_tensor(t) for t in inputs]
 
+def _scatter_tensor_meta(self, src, scatter_dim, tag, rankset, group_size):
+    out_size = list(self.size())
+    out_size[scatter_dim] //= group_size
+    return self.new_empty(out_size)
+
 # NB: We often say all_to_all has dynamic output size, but this is not
 # technically true: instead, what typically happens is you manually
 # communicate the output_split_sizes ahead of time (which is dynamic),
@@ -628,6 +667,7 @@ def _register_ops():
         "reduce_scatter_tensor(Tensor input, str reduceOp, str tag, int[] ranks, int group_size) -> Tensor",
         "reduce_scatter_tensor_coalesced(Tensor[] inputs, str reduceOp, str tag, int[] ranks, int group_size) -> Tensor[]",
         "all_to_all_single(Tensor input, SymInt[]? output_split_sizes, SymInt[]? input_split_sizes, str tag, int[] ranks, int group_size) -> Tensor",  # noqa: B950
+        "scatter_tensor(Tensor self, int src, int scatter_dim, str tag, int[] ranks, int group_size) -> Tensor",
     ]
 
     my_module = sys.modules[__name__]

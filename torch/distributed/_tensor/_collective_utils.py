@@ -54,7 +54,7 @@ def mesh_scatter(
     # remove the check below once that is done.
     if output.is_meta:
         return None
-    dim_group = mesh.get_dim_groups(mesh_dim)
+    dim_group = mesh.get_group(mesh_dim)
     assert isinstance(dim_group, ProcessGroup)
     # src need to be global rank
     src_for_dim = 0
@@ -110,7 +110,7 @@ def mesh_broadcast(
     # remove the check below once that is done.
     if tensor.is_meta:
         return None
-    dim_group = mesh.get_dim_groups(mesh_dim)
+    dim_group = mesh.get_group(mesh_dim)
     assert isinstance(dim_group, ProcessGroup)
     # src need to be global rank
     src_for_dim = 0
@@ -128,7 +128,7 @@ def mesh_all_to_all(
     mesh_dim: int = 0,
     async_op: bool = False,
 ) -> Optional[Work]:
-    dim_group = mesh.get_dim_groups(mesh_dim)
+    dim_group = mesh.get_group(mesh_dim)
     assert isinstance(dim_group, ProcessGroup)
 
     work = None
@@ -285,3 +285,21 @@ def redistribute_cost(
             return float("inf")
 
     return cost
+
+def check_tensor_meta(local_tensor, check_shape_stride=False):
+    local_metadata = {
+        'dtype': local_tensor.dtype,
+        'requires_grad': local_tensor.requires_grad
+    }
+
+    if check_shape_stride:
+        local_metadata.update({
+            'shape': local_tensor.shape,
+            'stride': local_tensor.stride()
+        })
+
+    gathered_metadata = [None for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather_object(gathered_metadata, local_metadata)
+
+    # Check if metadata is consistent across ranks
+    return all(meta == local_metadata for meta in gathered_metadata)

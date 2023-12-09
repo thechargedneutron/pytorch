@@ -12,7 +12,6 @@
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
-#include <torch/csrc/distributed/c10d/UCCForNCCL.hpp>
 
 #include <ATen/DynamicLibrary.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -44,6 +43,12 @@ static std::vector<std::string> TORCH_NCCL_ASYNC_ERROR_HANDLING = {
     "TORCH_NCCL_ASYNC_ERROR_HANDLING",
     "NCCL_ASYNC_ERROR_HANDLING"};
 
+// Environment Variable to control whether dumping debug info on watchdog
+// timeout is enabled. This variable must be set together with
+// TORCH_NCCL_ENABLE_MONITORING=1 and TORCH_NCCL_TRACE_BUFFER_SIZE > 0.
+static std::vector<std::string> TORCH_NCCL_DUMP_ON_TIMEOUT = {
+    "TORCH_NCCL_DUMP_ON_TIMEOUT"};
+
 // Environment Variable to control whether Desync Debug is enabled.
 // This variable must be set together with TORCH_NCCL_ASYNC_ERROR_HANDLING.
 static std::vector<std::string> TORCH_NCCL_DESYNC_DEBUG = {
@@ -59,6 +64,9 @@ static std::vector<std::string> TORCH_NCCL_ENABLE_MONITORING = {
 
 static std::vector<std::string> TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC = {
     "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"};
+
+static std::vector<std::string> TORCH_NCCL_TRACE_BUFFER_SIZE = {
+    "TORCH_NCCL_TRACE_BUFFER_SIZE"};
 
 constexpr const char* NCCL_BACKEND_NAME = "nccl";
 
@@ -345,10 +353,8 @@ class TORCH_API ProcessGroupNCCL : public Backend {
 
     // Optional "parent" backend and color to create communicators from
     // via `ncclCommSplit`
-#ifdef NCCL_HAS_COMM_SPLIT
     std::shared_ptr<ProcessGroupNCCL> split_from;
     int64_t split_color{0};
-#endif
   };
 
   // If you wish to create multiple process groups, each with a potentially
@@ -529,9 +535,6 @@ class TORCH_API ProcessGroupNCCL : public Backend {
 
   // Provide an API for users to define their own ways to store NCCL debug info.
   void registerDebugInfoWriter(std::unique_ptr<DebugInfoWriter> writer);
-
-  // Tests if the UCC fallback path is available
-  bool isUCCAvailable() const;
 
   // Provides an API to abort the ProcessGroup (similar to ncclCommAbort)
   // instead of relying on ProcessGroupNCCL destructor.
@@ -761,6 +764,9 @@ class TORCH_API ProcessGroupNCCL : public Backend {
   // The time interval used for deciding whether there is no watchdog heartbeat.
   int heartbeatTimeoutInSec_;
 
+  // Size of ring buffer where we store NCCL Traces for debugging.
+  int ncclTraceBufferSize_;
+
   // We gate the heartbeat monitor thread so that we can roll it out gradually.
   std::atomic<bool> monitorThreadEnabled_;
 
@@ -872,6 +878,9 @@ class TORCH_API ProcessGroupNCCL : public Backend {
   // Whether or not to enable timeout root cause analysis.
   bool desyncDebug_;
 
+  // Whether or not to dump debug info on timeout
+  bool dumpOnTimeout_;
+
   // Whether or not to create start CUDAEvent and enable timing for start
   // and end events. Note that enableTiming_ is always true if desyncDebug_
   // is set to true.
@@ -899,11 +908,6 @@ class TORCH_API ProcessGroupNCCL : public Backend {
   // The callback function to store NCCL debug info.
   std::unique_ptr<DebugInfoWriter> debugInfoWriter_ = nullptr;
 
-#ifdef USE_NCCL_WITH_UCC
-  // ProcessGroupUCC shared library handle and ProcessGroup pointer
-  static std::shared_ptr<at::DynamicLibrary> uccLib_;
-  c10::intrusive_ptr<Backend> uccPG_;
-#endif
   size_t uid_;
 };
 

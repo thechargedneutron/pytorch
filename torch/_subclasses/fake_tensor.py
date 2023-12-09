@@ -315,6 +315,13 @@ class FakeTensorConverter:
         symbolic_context=None,
         memoized_only=False,
     ):
+        # see note [Tensor Fakification and Symbol Caching]
+        if not symbolic_context and not source and shape_env:
+            if tracing_context := torch._guards.TracingContext.try_get():
+                if t in tracing_context.tensor_to_context:
+                    symbolic_context = tracing_context.tensor_to_context[t]
+                    source = symbolic_context.tensor_source
+
         maybe_memo = self._get_memo(t)
         if maybe_memo is not None:
             return maybe_memo
@@ -1674,6 +1681,11 @@ class FakeTensorMode(TorchDispatchMode):
             )
 
         def maybe_run_unsafe_fallback(error=None):
+            # We infer the meta of a custom ops that return None to just
+            # return None. custom ops are not allowed to mutate metadata
+            # of their inputs, so this is safe.
+            if can_generate_trivial_abstract_impl(func):
+                return None
             # no meta kernel registered, fallback to kernel for the device
             if has_symbolic_sizes or not can_run_unsafe_fallback(func):
                 raise UnsupportedOperatorException(func)
@@ -1868,6 +1880,12 @@ class FakeTensorMode(TorchDispatchMode):
                 symbolic_context is None
             ), "cannot set both static_shapes and symbolic_context"
             shape_env = None
+        # see note [Tensor Fakification and Symbol Caching]
+        if not symbolic_context and not source and not static_shapes:
+            if tracing_context := torch._guards.TracingContext.try_get():
+                if tensor in tracing_context.tensor_to_context:
+                    symbolic_context = tracing_context.tensor_to_context[tensor]
+                    source = symbolic_context.tensor_source
         return self.fake_tensor_converter(
             self,
             tensor,
@@ -1938,6 +1956,22 @@ def run_fallback_kernel(
             return e
 
     return pytree.tree_map(map_out, r)
+
+
+def can_generate_trivial_abstract_impl(op: torch._ops.OpOverload) -> bool:
+    assert isinstance(op, torch._ops.OpOverload)
+    if torch._library.utils.is_builtin(op):
+        # We control the built-ins. These may (in rare cases)
+        # do input metadata mutation (which we have banned on custom ops)
+        return False
+    schema = op._schema
+    # It's suspicious if the op is not mutable but returns nothing, so we return False out of an abundance of caution
+    if not schema.is_mutable:
+        return False
+    if len(schema.returns) > 0:
+        return False
+    # If the op returns nothing, then it has a trivial abstract impl.
+    return True
 
 
 # Just for use to allow copying a module to fake tensors,

@@ -155,6 +155,31 @@ def _broadcast(self, src, tag, ranks, group_size):
 
     return inplace_tensor
 
+def _scatter_tensor(
+    self: torch.Tensor,
+    src: int,
+    scatter_dim: int,
+    tag: str,
+    ranks: List[int],
+    group_size: int,
+) -> torch.Tensor:
+    group = c10d._find_or_create_pg_by_ranks_and_tag(tag, ranks, group_size)
+    assert group is not None
+
+    # Determine the size of the scattered tensor for each rank.
+    scatter_size = list(self.size())
+    scatter_size[scatter_dim] //= group_size
+
+    # Create an empty tensor for the scatter operation.
+    out_tensor = self.new_empty(scatter_size)
+    
+    # Perform the actual scatter operation.
+    # The scatter operation should scatter the input tensor across ranks.
+    work = dist.scatter(out_tensor, self if dist.get_rank(group) == src else None, src=src, group=group, async_op=True)
+
+    _register_tensor_work(out_tensor, work)
+    return out_tensor
+
 # TODO assert if ranks has duplicated entries
 def _all_reduce(self, reduceOp, tag, ranks, group_size):
     op = _str_to_reduce_op(reduceOp)

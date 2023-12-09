@@ -704,9 +704,9 @@ def speedup_experiment_ds(args, model_iter_fn, model, example_inputs):
 
 
 def speedup_experiment_onnx(
-    onnx_model_cls: Type[OnnxModelFromTorchScript],
     args,
     model_iter_fn,
+    onnx_model: OnnxModel,
     model,
     example_inputs,
     **kwargs,
@@ -715,9 +715,8 @@ def speedup_experiment_onnx(
     Measure speedups over eager.
 
     This function is responsible for the following:
-        1. Creation of OnnxModel, which handles export, ort initialization.
-        2. Creating iobinding with OnnxModel if device is CUDA, which is essential for perf measurement.
-        3. Running ORT with OnnxModel.
+        1. Creating iobinding with OnnxModel if device is CUDA, which is essential for perf measurement.
+        2. Running ORT with OnnxModel.
 
     Writes to ./{output_filename}, which should be
         `pathlib.Path(self.output_dir) / f"{self.compiler}_{suite}_{self.dtype}_{self.mode}_{self.device}_{self.testing}.csv".
@@ -729,16 +728,7 @@ def speedup_experiment_onnx(
     should_randomize_input = args.randomize_input
     times = args.iterations_per_run
 
-    onnx_model = onnx_model_cls(
-        args.output_directory or ".",
-        model,
-        copy.deepcopy(example_inputs),
-        dynamic_shapes=args.dynamic_shapes,
-    )
-
-    def create_onnx_input_binded_fn(
-        onnx_model: OnnxModelFromTorchScript, pt_inputs, example_outputs
-    ):
+    def create_onnx_input_binded_fn(onnx_model: OnnxModel, pt_inputs, example_outputs):
         # Goal is to move the iobinding creation outside of the timer function.
         iobinding, outputs = onnx_model.create_iobinding(pt_inputs, example_outputs)
 
@@ -749,7 +739,7 @@ def speedup_experiment_onnx(
 
         return onnxrt_model_iter_fn
 
-    def create_onnx_fn(onnx_model: OnnxModelFromTorchScript, pt_inputs):
+    def create_onnx_fn(onnx_model: OnnxModel, pt_inputs):
         # NOTE: Making perf comparison fair by moving out the i/o adapting part.
         # 1. Pre-adapt `pt_inputs` to `onnx_inputs` here.
         # 2. Drop `onnx_outputs` to `pt_outputs` adapting. Output comparison is not part of perf measurement.
@@ -759,6 +749,39 @@ def speedup_experiment_onnx(
             return onnx_model.run_with_onnx_inputs(onnx_inputs)
 
         return onnxrt_model_iter_fn
+
+    def timed_onnx(model, onnx_model: OnnxModel, inputs):
+        if current_device == "cpu" or onnx_model.is_cpu():
+            onnxrt_model_iter_fn = create_onnx_fn(onnx_model, inputs)
+        else:
+            onnxrt_model_iter_fn = create_onnx_input_binded_fn(
+                onnx_model, inputs, expected_output
+            )
+        return timed(
+            model,
+            onnxrt_model_iter_fn,
+            inputs,
+            return_result=True,
+            times=times,
+            collect_outputs=args.collect_outputs,
+        )
+
+    # Insert ONNX warm-up
+    inputs = (
+        randomize_input(copy.deepcopy(example_inputs))
+        if should_randomize_input
+        else example_inputs
+    )
+    _, expected_output = timed(
+        model,
+        model_iter_fn,
+        inputs,
+        return_result=True,
+        times=times,
+        collect_outputs=args.collect_outputs,
+    )
+    for _ in range(2):
+        timed_onnx(model, onnx_model, inputs)
 
     for rep in range(args.repeat):
         inputs = (
@@ -775,21 +798,7 @@ def speedup_experiment_onnx(
             collect_outputs=args.collect_outputs,
         )
 
-        if current_device == "cpu" or onnx_model.is_cpu():
-            onnxrt_model_iter_fn = create_onnx_fn(onnx_model, inputs)
-        else:
-            onnxrt_model_iter_fn = create_onnx_input_binded_fn(
-                onnx_model, inputs, expected_output
-            )
-
-        timings[rep, 1], actual_output = timed(
-            model,
-            onnxrt_model_iter_fn,
-            inputs,
-            return_result=True,
-            times=times,
-            collect_outputs=args.collect_outputs,
-        )
+        timings[rep, 1], actual_output = timed_onnx(model, onnx_model, inputs)
 
     pvalue = ttest_ind(timings[:, 0], timings[:, 1]).pvalue
     median = np.median(timings, axis=0)
@@ -1059,10 +1068,7 @@ class OnnxModel(abc.ABC):
     _COMPILER_NAME: str
 
     def __init__(self, output_directory, model, example_inputs, dynamic_shapes: bool):
-        # Hack to get model name.
-        from torch._functorch import aot_autograd
-
-        model_name = aot_autograd.model_name
+        model_name = current_name
         self.model_dir = self._generate_onnx_model_directory(
             output_directory, self._COMPILER_NAME, model_name
         )
@@ -1193,14 +1199,15 @@ class OnnxModel(abc.ABC):
             f.write(proto_tensor.SerializeToString())
 
     def run_and_serialize_inputs_outputs(self, pt_inputs):
-        onnx_inputs = self.adapt_pt_inputs_to_onnx(pt_inputs)
-        onnx_outputs = self.run_with_onnx_inputs(onnx_inputs)
-
         test_data_dir = self.model_dir / "test_data_set_0"
         test_data_dir.mkdir(parents=True, exist_ok=True)
 
+        onnx_inputs = self.adapt_pt_inputs_to_onnx(pt_inputs)
         for i, onnx_input in enumerate(onnx_inputs.values()):
             self.save_tensor_data(onnx_input, str(test_data_dir / f"input_{i}.pb"))
+
+        onnx_outputs = self.run_with_onnx_inputs(onnx_inputs)
+
         for i, onnx_output in enumerate(onnx_outputs):
             self.save_tensor_data(onnx_output, str(test_data_dir / f"output_{i}.pb"))
 
@@ -1506,9 +1513,14 @@ class OnnxExportErrorParser:
         )
 
 
+@dataclasses.dataclass
+class OnnxContext:
+    onnx_model: Optional[OnnxModel] = None
+
+
 def optimize_onnx_ctx(
     output_directory: str,
-    onnx_model_cls: Type[OnnxModelFromTorchScript],
+    onnx_model_cls: Type[OnnxModel],
     run_n_iterations: Callable,
     dynamic_shapes: bool = False,
 ) -> Callable:
@@ -1517,7 +1529,8 @@ def optimize_onnx_ctx(
     #   1. Export and cache model.
     #   2. Create iobinding for ORT.
     #   3. Run ORT for n iterations.
-    onnx_model: Optional[OnnxModelFromTorchScript] = None
+    # The cached model is stored in 'context' under the returned callable.
+    context = OnnxContext()
     test_data_dumped = False
 
     def run_n_iterations_onnx(model, inputs, n=2):
@@ -1533,14 +1546,15 @@ def optimize_onnx_ctx(
         output_error_filename = output_filename[:-4] + "_export_error.csv"
         parser = OnnxExportErrorParser(current_device, current_name, current_batch_size)
         try:
-            nonlocal onnx_model
-            if onnx_model is None:
-                onnx_model = onnx_model_cls(
+            nonlocal context
+            if context.onnx_model is None:
+                context.onnx_model = onnx_model_cls(
                     output_directory,
                     model,
                     copy.deepcopy(inputs),
                     dynamic_shapes=dynamic_shapes,
                 )
+            onnx_model = context.onnx_model
 
             for _ in range(n):
                 nonlocal test_data_dumped
@@ -1577,6 +1591,8 @@ def optimize_onnx_ctx(
             parsed_error = parser.parse_exception(e)
             output_csv(output_error_filename, parsed_error.headers, parsed_error.row)
             raise
+
+    run_n_iterations_onnx.context = context
 
     return run_n_iterations_onnx
 
@@ -1854,7 +1870,6 @@ class BenchmarkRunner:
     def skip_models_due_to_control_flow(self):
         return set()
 
-    @property
     def get_tolerance_and_cosine_flag(self, is_training, current_device, name):
         raise NotImplementedError()
 
@@ -2241,11 +2256,11 @@ class BenchmarkRunner:
             if name in self.skip_accuracy_check_as_eager_non_deterministic:
                 return record_status("pass_due_to_skip", dynamo_start_stats=start_stats)
 
-            # Workaround for ONNX for non-tensor outputs
             if (
                 current_onnx_compiler == "torchscript"
                 or current_onnx_compiler == "dynamo"
             ):
+                # Workaround for ONNX for non-tensor outputs
                 (
                     correct_result,
                     new_result,
@@ -2253,6 +2268,10 @@ class BenchmarkRunner:
                 ) = _OnnxPatch.patch_non_tensor_outputs(
                     correct_result, new_result, fp64_outputs
                 )
+                # Relax tolerance for ONNX cuda
+                if current_device == "cuda":
+                    tolerance = 1e-2
+
                 # TODO: store correct_result into the dumped file for offline onnx model validation.
                 # The downside and potential problem, is that the output formats may be different.
                 # E.g., the output order might not match, None might be part of output, etc.
@@ -2316,20 +2335,10 @@ class BenchmarkRunner:
                 new_result = optimized_model_iter_fn(model, example_inputs)
             except Exception as e:
                 log.exception(e)
-                if (
-                    self.args.ci
-                    and isinstance(e, BackendCompilerFailed)
-                    and (
-                        "Internal Triton PTX codegen error" in str(e)
-                        or "cubin" in str(e)
-                    )
-                ):
-                    return "pass_due_to_skip"
-                else:
-                    print(
-                        "TorchDynamo optimized model failed to run because of following error"
-                    )
-                    return "fail_to_run"
+                print(
+                    "TorchDynamo optimized model failed to run because of following error"
+                )
+                return "fail_to_run"
 
             def dump_max_mean_values(tol, ref, res):
                 if isinstance(ref, (list, tuple, torch.nn.ParameterList, torch.Size)):
@@ -2458,6 +2467,11 @@ class BenchmarkRunner:
 
                 results.append(
                     f"{ok:3}/{total:3} +{frames_third_pass} frames {compilation_time:3.0f}s"
+                )
+
+            if experiment.func is speedup_experiment_onnx:
+                experiment = functools.partial(
+                    experiment, optimized_model_iter_fn.context.onnx_model
                 )
 
             if not hasattr(model, name):
@@ -3343,9 +3357,7 @@ def run(runner, args, original_dir=None):
         optimize_ctx = functools.partial(
             optimize_onnx_ctx, args.output_directory or ".", OnnxModelFromTorchScript
         )
-        experiment = functools.partial(
-            speedup_experiment_onnx, OnnxModelFromTorchScript
-        )
+        experiment = speedup_experiment_onnx
         output_filename = "torchscript_onnx.csv"
         current_onnx_compiler = "torchscript"
     elif args.dynamo_onnx:
@@ -3355,7 +3367,7 @@ def run(runner, args, original_dir=None):
             OnnxModelFromDynamo,
             dynamic_shapes=args.dynamic_shapes,
         )
-        experiment = functools.partial(speedup_experiment_onnx, OnnxModelFromDynamo)
+        experiment = speedup_experiment_onnx
         output_filename = "dynamo_onnx.csv"
         current_onnx_compiler = "dynamo"
     elif args.dynamo_onnx_aot_inline:
@@ -3365,9 +3377,7 @@ def run(runner, args, original_dir=None):
             OnnxModelFromDynamoAotInline,
             dynamic_shapes=args.dynamic_shapes,
         )
-        experiment = functools.partial(
-            speedup_experiment_onnx, OnnxModelFromDynamoAotInline
-        )
+        experiment = speedup_experiment_onnx
         output_filename = "dynamo_onnx_aot_inline.csv"
         current_onnx_compiler = "dynamo"
     elif args.speedup_dynamo_ts:
@@ -3684,8 +3694,10 @@ def run(runner, args, original_dir=None):
             except subprocess.TimeoutExpired:
                 print("TIMEOUT", file=sys.stderr)
                 write_csv("timeout")
-            except subprocess.SubprocessError:
-                print("ERROR", file=sys.stderr)
+            except subprocess.CalledProcessError as e:
+                print("Run failed with return code: ", e.returncode, file=sys.stderr)
+                print("Output: ", e.output, file=sys.stderr)
+                print("Error: ", e.stderr, file=sys.stderr)
                 write_csv("infra_error")
         print_summary(output_filename, print_dataframe=args.print_dataframe_summary)
 

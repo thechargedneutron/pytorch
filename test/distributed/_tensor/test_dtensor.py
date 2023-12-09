@@ -14,7 +14,11 @@ from torch.distributed._tensor import (
     init_device_mesh,
 )
 from torch.distributed._tensor.placement_types import _Partial, Replicate, Shard
-from torch.distributed.tensor.parallel import PairwiseParallel, parallelize_module
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    parallelize_module,
+    RowwiseParallel,
+)
 
 from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.distributed._tensor.common_dtensor import (
@@ -109,13 +113,17 @@ class DTensorTest(DTensorTestBase):
     def test_modules_w_meta_dtensor(self):
         model = DummyMLP("meta")
         device_mesh = self.build_device_mesh()
-        model_tp = parallelize_module(model, device_mesh, PairwiseParallel())
+        parallelize_plan = {
+            "net1": ColwiseParallel(),
+            "net2": RowwiseParallel(),
+        }
+        model_tp = parallelize_module(model, device_mesh, parallelize_plan)
         model_tp.to_empty(device=self.device_type)
         model_tp.reset_parameters()
         optim = torch.optim.SGD(model_tp.parameters(), lr=0.1)
         model_regular = DummyMLP(self.device_type)
         model_regular_tp = parallelize_module(
-            model_regular, device_mesh, PairwiseParallel()
+            model_regular, device_mesh, parallelize_plan
         )
         optim_regular = torch.optim.SGD(model_regular_tp.parameters(), lr=0.1)
         model_regular_tp.reset_parameters()
@@ -209,7 +217,7 @@ class DTensorTest(DTensorTestBase):
         shard_placement = Shard(0)
         tensor_list, _ = shard_placement._split_tensor(
             global_tensor,
-            device_mesh.size(dim=0),
+            device_mesh.size(mesh_dim=0),
             with_padding=False,
             contiguous=True,
         )
@@ -235,7 +243,7 @@ class DTensorTest(DTensorTestBase):
         shard_placement = Shard(0)
         tensor_list, _ = shard_placement._split_tensor(
             global_tensor,
-            device_mesh.size(dim=0),
+            device_mesh.size(mesh_dim=0),
             with_padding=False,
             contiguous=True,
         )
@@ -796,7 +804,24 @@ class TestDTensorPlacementTypes(DTensorTestBase):
                     for unpadded_tensor in unpadded_list
                 ]
                 assert_array_equal(expected_is_tensor_empty, is_tensor_empty)
+    @with_comms
+    def test_metadata_consistency_check(self):
+        device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
+        placements = [Shard(0)]
 
+        # Create a local tensor with specific metadata
+        local_tensor = torch.randn(3, 3, requires_grad=True, dtype=torch.float32)
+
+        if self.rank == 0:
+            local_tensor = local_tensor.to(dtype=torch.float64)
+
+        with self.assertRaises(ValueError):
+            DTensor.from_local(local_tensor, device_mesh, placements, run_check=True)
+
+        try:
+            DTensor.from_local(local_tensor, device_mesh, placements, run_check=False)
+        except ValueError:
+            self.fail("Unexpected ValueError raised with run_check=False")
 
 if __name__ == "__main__":
     run_tests()

@@ -9,6 +9,7 @@ import torch.distributed._tensor.dispatch as op_dispatch
 import torch.distributed._tensor.random as random
 import torch.nn as nn
 from torch.distributed._tensor._collective_utils import mesh_broadcast
+from torch.distributed._tensor._collective_utils import check_tensor_meta
 from torch.distributed._tensor._utils import compute_global_tensor_info
 from torch.distributed._tensor.device_mesh import _mesh_resources, DeviceMesh
 from torch.distributed._tensor.placement_types import (
@@ -107,7 +108,6 @@ class _ToTorchTensor(torch.autograd.Function):
             None,
         )
 
-
 class _FromTorchTensor(torch.autograd.Function):
     @staticmethod
     def forward(  # type: ignore[override]
@@ -146,6 +146,10 @@ class _FromTorchTensor(torch.autograd.Function):
             # TODO: by default check tensor metas across rank
             # TODO: See if we need to make this run_check logic
             # have a corresponding backward.
+
+            if not check_tensor_meta(input, check_shape_stride=True):
+                    raise ValueError("Inconsistent tensor metadata (including shape and stride) across ranks.")
+
             for idx, placement in enumerate(placements):
                 if placement.is_replicate():
                     # broadcast rank 0 tensor to all ranks
@@ -255,7 +259,7 @@ class DTensor(torch.Tensor):  # pyre-ignore[13]: pyre is bad at __new__
         return ["_local_tensor"], (self._spec, self.requires_grad)
 
     @staticmethod
-    def __tensor_unflatten__(inner_tensors, flatten_spec):
+    def __tensor_unflatten__(inner_tensors, flatten_spec, outer_size, outer_stride):
         assert (
             flatten_spec is not None
         ), "Expecting spec to be not None from `__tensor_flatten__` return value!"
@@ -265,10 +269,10 @@ class DTensor(torch.Tensor):  # pyre-ignore[13]: pyre is bad at __new__
             local_tensor,
             spec.mesh,
             spec.placements,
-            shape=spec.tensor_meta.shape,
+            shape=outer_size,
             dtype=spec.tensor_meta.dtype,
             requires_grad=requires_grad,
-            stride=spec.tensor_meta.stride,
+            stride=outer_stride,
         )
 
     __torch_function__ = torch._C._disabled_torch_function_impl
