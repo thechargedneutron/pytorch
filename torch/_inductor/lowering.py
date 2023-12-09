@@ -5293,6 +5293,10 @@ try:
     @register_lowering(c10d_functional.broadcast)
     def broadcast(input, src, tag, ranks, group_size):
         return ir.Broadcast.create(input, src, tag, ranks, group_size)
+    
+    @register_lowering(c10d_functional.scatter_tensor)
+    def scatter_tensor(input, src, scatter_dim, tag, ranks, group_size):
+        return TensorBox.create( ir.ScatterTensor.create(input, src, scatter_dim, tag, ranks, group_size))
 
     @register_lowering(c10d_functional.all_reduce)
     def allreduce(input, reduce_op, tag, ranks, group_size):

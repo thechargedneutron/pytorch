@@ -6966,6 +6966,47 @@ class Broadcast(InPlaceCollectiveKernel):
             f"{output_name}, async_op=True, group={output_name}_pg, src={self.src})"
         )
 
+class ScatterTensor(OutOfPlaceCollectiveKernel):
+    def __init__(self, layout, inputs, outputs, constant_args, src):
+        super().__init__(layout, inputs, outputs, constant_args)
+        self.src = src
+
+    @classmethod
+    def create(
+        cls,
+        x: "TensorBox",
+        src: int,
+        scatter_dim: int,
+        tag: str,
+        ranks: List[int],
+        group_size: int,
+    ):
+        inputs = [cls.realize_input(x)]
+
+        # Compute the size of the output tensor for each rank after scatter operation
+        def compute_size(new_size):
+            new_size[scatter_dim] //= group_size
+
+        outputs = cls.create_output_buffers(inputs, compute_size)
+
+        layout = MultiOutputLayout(inputs[0].get_device())
+
+        packed = ScatterTensor(
+            layout=layout,
+            inputs=inputs,
+            outputs=outputs,
+            constant_args=[tag, ranks, group_size],
+            src=src,
+        )
+        return cls.create_output_nodes(packed, outputs)[0]
+
+    def codegen_collective(self, wrapper, output_name, input_names):
+        # Generate the code for the scatter operation
+        wrapper.writeline(
+            f"{output_name}_work = dist.scatter("
+            f"{input_names[0]}, src={self.src}, "
+            f"async_op=True, group={output_name}_pg)"
+        )
 
 class AllReduceCoalesced(InPlaceCollectiveKernel):
     def __init__(self, layout, inputs, constant_args, reduce_op):
